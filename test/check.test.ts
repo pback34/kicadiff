@@ -21,6 +21,10 @@ const CLI = path.join(PROJECT_DIR, "kicadiff");
 const BLINK_FIXTURE_DIR = path.join(PROJECT_DIR, "examples/blink");
 const BLINK_PCB = path.join(BLINK_FIXTURE_DIR, "blink.kicad_pcb");
 const BLINK_SCH = path.join(BLINK_FIXTURE_DIR, "blink.kicad_sch");
+// mcu-board has a filled GND zone on B.Cu and several genuinely
+// unconnected nets — the two things that made DRC output unstable.
+const MCU_FIXTURE_DIR = path.join(PROJECT_DIR, "examples/mcu-board");
+const MCU_PCB = path.join(MCU_FIXTURE_DIR, "mcu-board.kicad_pcb");
 
 // =============================================================================
 // Unit tests for the violation differ.
@@ -168,6 +172,73 @@ test.describe("formatCheckDiff", () => {
 // Without this, a missing kicad-cli on PATH degrades to a generic
 // "report file missing" error that hides ENOENT.
 // =============================================================================
+
+/** Write a `kicad-cli` shim into `dir` that logs every invocation's argv
+ *  (one line per call) to `log`, answers `pcb drc --help` with `help`,
+ *  and otherwise writes an empty DRC report to --output. */
+function writeDrcShim(dir: string, log: string, help: string): void {
+  const shim = path.join(dir, "kicad-cli");
+  fs.writeFileSync(shim, [
+    "#!/bin/sh",
+    `echo "$*" >> "${log}"`,
+    "for a in \"$@\"; do",
+    `  if [ "$a" = "--help" ]; then printf '%s\\n' '${help}'; exit 0; fi`,
+    "done",
+    "out=",
+    "while [ $# -gt 0 ]; do",
+    "  case \"$1\" in",
+    "    --output) out=\"$2\"; shift 2 ;;",
+    "    *) shift ;;",
+    "  esac",
+    "done",
+    "printf '{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}' > \"$out\"",
+    "exit 0",
+  ].join("\n"));
+  fs.chmodSync(shim, 0o755);
+}
+
+test.describe("runDrc: zone refill", () => {
+  test("passes --refill-zones (never --save-board) when kicad-cli supports it", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-refill-"));
+    const origPath = process.env.PATH;
+    try {
+      const log = path.join(tmp, "argv.log");
+      writeDrcShim(tmp, log, "  --refill-zones          Refill zones before running DRC");
+      process.env.PATH = tmp;
+      const fakePcb = path.join(tmp, "fake.kicad_pcb");
+      fs.writeFileSync(fakePcb, "");
+      expect(runDrc(fakePcb, path.join(tmp, "report.json"))).toEqual([]);
+      const drcCall = fs.readFileSync(log, "utf8").split("\n").find(l => l.includes("--output"));
+      expect(drcCall).toContain("--refill-zones");
+      expect(drcCall).not.toContain("--save-board");
+    } finally {
+      process.env.PATH = origPath;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("omits --refill-zones on a kicad-cli that doesn't have it (KiCad 9)", () => {
+    // `pcb drc --refill-zones` first shipped in KiCad 10.0; KiCad 9's
+    // kicad-cli rejects unknown flags, so passing it blindly would break
+    // `check` there entirely.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-norefill-"));
+    const origPath = process.env.PATH;
+    try {
+      const log = path.join(tmp, "argv.log");
+      writeDrcShim(tmp, log, "  --exit-code-violations  Return a nonzero exit code if DRC violations exist");
+      process.env.PATH = tmp;
+      const fakePcb = path.join(tmp, "fake.kicad_pcb");
+      fs.writeFileSync(fakePcb, "");
+      expect(runDrc(fakePcb, path.join(tmp, "report.json"))).toEqual([]);
+      const drcCall = fs.readFileSync(log, "utf8").split("\n").find(l => l.includes("--output"));
+      expect(drcCall).toBeTruthy();
+      expect(drcCall).not.toContain("--refill-zones");
+    } finally {
+      process.env.PATH = origPath;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
 
 test.describe("runDrc / runErc error surfacing", () => {
   test("runDrc: missing kicad-cli surfaces ENOENT / launch error", () => {
@@ -410,6 +481,45 @@ function initRepoWithBlink(dir: string): string {
   }).trim();
 }
 
+/** Copy mcu-board into `dir` (optionally replacing the .kicad_pcb text)
+ *  and commit it. */
+function initRepoWithMcuBoard(dir: string, pcbSource?: string): string {
+  fs.cpSync(MCU_FIXTURE_DIR, dir, { recursive: true });
+  const pcb = path.join(dir, path.basename(MCU_PCB));
+  if (pcbSource !== undefined) fs.writeFileSync(pcb, pcbSource);
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dir });
+  for (const args of [["add", "."], ["commit", "-q", "-m", "init"]]) {
+    execFileSync("git", [
+      "-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t", ...args,
+    ], { cwd: dir });
+  }
+  return pcb;
+}
+
+/** Drop every `(filled_polygon …)` block: the zones stay, but their fill
+ *  is gone, as in a board saved without refilling after an edit. */
+function stripZoneFills(src: string): string {
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const start = src.indexOf("(filled_polygon", i);
+    if (start < 0) return out + src.slice(i);
+    out += src.slice(i, start);
+    let depth = 0;
+    let j = start;
+    for (; j < src.length; j++) {
+      if (src[j] === "(") depth++;
+      else if (src[j] === ")" && --depth === 0) break;
+    }
+    i = j + 1;
+  }
+}
+
+function kicadCliHasRefillZones(): boolean {
+  const r = spawnSync("kicad-cli", ["pcb", "drc", "--help"], { encoding: "utf8" });
+  return (r.stdout ?? "").includes("--refill-zones");
+}
+
 test.beforeAll(() => {
   if (!fs.existsSync(BLINK_PCB)) test.skip(true, `KiCad fixture missing: ${BLINK_PCB}`);
 });
@@ -427,6 +537,48 @@ test.describe("kicadiff check (integration)", () => {
       expect(r.stdout).toContain("(drc)");
       expect(r.stdout).toMatch(/\+0\b/);
       expect(r.stdout).toMatch(/-0\b/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("DRC refills zones: a stale zone fill reports the same as a filled board", () => {
+    // Without --refill-zones, kicad-cli checks whatever fill is saved in
+    // the file; an unfilled GND pour then surfaces as extra
+    // unconnected_items that the designer never sees in the GUI.
+    test.skip(!kicadCliHasRefillZones(), "kicad-cli has no `pcb drc --refill-zones` (KiCad < 10)");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-stale-"));
+    try {
+      const filled = path.join(tmp, "filled.kicad_pcb");
+      const stale = path.join(tmp, "stale.kicad_pcb");
+      const src = fs.readFileSync(MCU_PCB, "utf8");
+      fs.writeFileSync(filled, src);
+      fs.writeFileSync(stale, stripZoneFills(src));
+      expect(fs.readFileSync(stale, "utf8")).not.toContain("filled_polygon");
+      const count = (pcb: string) => runDrc(pcb, pcb.replace(/\.kicad_pcb$/, ".json"))
+        .filter(v => v.type === "unconnected_items").length;
+      expect(count(stale)).toBe(count(filled));
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("check never modifies the board it checks (working tree side)", () => {
+    // --refill-zones recomputes fills in memory; kicad-cli only writes the
+    // board with --save-board, and check runs it on a temp copy anyway.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-untouched-"));
+    try {
+      const pcb = initRepoWithMcuBoard(tmp, stripZoneFills(fs.readFileSync(MCU_PCB, "utf8")));
+      const before = fs.readFileSync(pcb);
+      const listing = fs.readdirSync(tmp).sort();
+      const r = spawnSync(CLI, ["check", "HEAD", pcb], {
+        cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(r.stdout).toContain("(drc)");
+      expect(fs.readFileSync(pcb).equals(before)).toBe(true);
+      expect(fs.readdirSync(tmp).sort()).toEqual(listing);
+      const status = execFileSync("git", ["status", "--porcelain", "--ignored"], { cwd: tmp, encoding: "utf8" });
+      expect(status).toBe("");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
