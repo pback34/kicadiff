@@ -16,6 +16,7 @@ import VIEWER_HTML from "./viewer-content.ts";
 import type { FileType, Manifest, ProjectManifest, SideManifest } from "./types.ts";
 import { splitDiff } from "./diff-overlay.ts";
 import { compositePcbLayers } from "./composite.ts";
+import { copperLayers, defaultPcbLayers, parseBoardLayers, plotFileSuffix } from "./layers.ts";
 import { SENTINEL_NAME } from "./cache.ts";
 import { Resvg } from "@resvg/resvg-js";
 
@@ -33,7 +34,6 @@ function rasterise(svgPath: string, pngPath: string, widthPx: number): void {
   fs.writeFileSync(pngPath, resvg.render().asPng());
 }
 
-const PCB_LAYERS = "F.Cu,B.Cu,F.Silkscreen,B.Silkscreen,Edge.Cuts";
 // python3 used to be required by an earlier bash-era hook; the TS render
 // path doesn't shell out to it, so requiring it would needlessly fail on
 // machines that have kicad-cli but no Python.
@@ -63,6 +63,10 @@ export interface RenderOptions {
    *  When false, the rendered PNGs are also persisted to ~/.cache/kicadiff/
    *  so that subsequent runs against the same content return near-instantly. */
   noCache?: boolean;
+  /** PCB layers to render (kicad-cli `--layers` names). Default: every
+   *  copper layer in the board's layer table + F/B.Silkscreen + Edge.Cuts,
+   *  resolved per side so a layer-count change between refs shows up. */
+  layers?: string[];
 }
 
 export interface RenderResult {
@@ -282,6 +286,7 @@ function cacheKeyFor(
   fileType: FileType,
   filePath: string,
   siblings: ProjectSibling[],
+  pcbLayers: readonly string[],
 ): string {
   const h = crypto.createHash("sha256");
   // Bumping any of these ingredients invalidates old cache entries:
@@ -296,6 +301,8 @@ function cacheKeyFor(
   //     .kicad_pcb / .kicad_sch content is unchanged); read from the same
   //     source as the file content (working tree vs. git ref) so the key
   //     matches what kicad-cli will actually see.
+  //   - the PCB layer set handed to kicad-cli (`--layers` can change it
+  //     without the source content changing)
   //   - source content
   // Bumped to v4 when SVG → PNG switched from rsvg-convert to
   // @resvg/resvg-js: rasteriser output bytes differ slightly even for
@@ -304,13 +311,17 @@ function cacheKeyFor(
   // Bump on every change that alters the bytes we cache. v5: PCB
   // combined PNG is now alpha-composited from the per-layer PNGs
   // (viewer-equivalent translucency, F.Cu on top) instead of a flat
-  // raster of kicad-cli's combined SVG.
-  h.update("kicadiff-cache-v5\0");
+  // raster of kicad-cli's combined SVG. v6: PCB layer set is read from
+  // the board (inner copper layers are now rendered), so v5 entries for
+  // multi-layer boards are missing layers.
+  h.update("kicadiff-cache-v6\0");
   h.update(getKicadCliVersion());
   h.update("\0");
   h.update(fileType);
   h.update("\0");
   h.update(path.resolve(filePath));
+  h.update("\0");
+  h.update(pcbLayers.join(","));
   h.update("\0");
 
   for (const { name, content: c } of siblings) {
@@ -425,11 +436,11 @@ function writeContentToTempBeside(content: Buffer, nearFile: string): string {
 // Rendering primitives
 // =============================================================================
 
-async function renderPcbCombined(input: string, outputSvg: string): Promise<void> {
+async function renderPcbCombined(input: string, outputSvg: string, layers: readonly string[]): Promise<void> {
   await run("kicad-cli", [
     "pcb", "export", "svg",
     "--mode-single",
-    "--layers", PCB_LAYERS,
+    "--layers", layers.join(","),
     "--page-size-mode", "2",
     "--exclude-drawing-sheet",
     "-o", outputSvg,
@@ -437,17 +448,34 @@ async function renderPcbCombined(input: string, outputSvg: string): Promise<void
   ]);
 }
 
-async function renderPcbLayers(input: string, outputDir: string): Promise<void> {
+async function renderPcbLayers(
+  input: string,
+  outputDir: string,
+  layers: readonly string[],
+  boardSrc: string,
+): Promise<void> {
   fs.mkdirSync(outputDir, { recursive: true });
   await run("kicad-cli", [
     "pcb", "export", "svg",
     "--mode-multi",
-    "--layers", PCB_LAYERS,
+    "--layers", layers.join(","),
     "--page-size-mode", "2",
     "--exclude-drawing-sheet",
     "-o", `${outputDir}/`,
     input,
   ]);
+  // kicad-cli names each plot file after the layer's *user* name when one
+  // is set (`(4 "In1.Cu" power "GND")` → `<board>-GND.svg`). Rename copper
+  // layers back to their canonical name so the manifest, the composite and
+  // the viewer key every board the same way (and a renamed F.Cu still
+  // gets the active-layer treatment).
+  const base = path.basename(input, ".kicad_pcb");
+  for (const l of copperLayers(parseBoardLayers(boardSrc))) {
+    if (l.userName === undefined) continue;
+    const from = path.join(outputDir, `${base}-${plotFileSuffix(l.userName)}.svg`);
+    const to = path.join(outputDir, `${base}-${plotFileSuffix(l.name)}.svg`);
+    if (from !== to && fs.existsSync(from) && !fs.existsSync(to)) fs.renameSync(from, to);
+  }
   // Convert each generated SVG to PNG (preserves alpha). resvg-js is
   // synchronous so there's no async to await, but we still touch every SVG
   // sequentially — kicad-cli is the heavy step, not this.
@@ -949,8 +977,8 @@ export async function render(opts: RenderOptions): Promise<RenderResult> {
       if (fileType === "pcb") {
         // Combined and layered exports are independent → run in parallel
         await Promise.all([
-          renderPcbCombined(src, targetSvg),
-          renderPcbLayers(src, layersDir),
+          renderPcbCombined(src, targetSvg, pcbLayers),
+          renderPcbLayers(src, layersDir, pcbLayers, boardSrc),
         ]);
         // Build the side-level combined PNG by alpha-compositing the
         // per-layer PNGs at viewer-equivalent opacity / z-order
@@ -983,7 +1011,9 @@ export async function render(opts: RenderOptions): Promise<RenderResult> {
     let content: Buffer | null = null;
     if (isWorkingTree(ref)) {
       if (!fs.existsSync(filePath)) return false;
-      if (useCache) content = fs.readFileSync(filePath);
+      // PCBs always need the content: the default layer set comes from
+      // the board's own layer table.
+      if (useCache || fileType === "pcb") content = fs.readFileSync(filePath);
     } else {
       if (!repoRoot) return false;
       content = gitReadAtRef(repoRoot, ref, relPath);
@@ -996,8 +1026,13 @@ export async function render(opts: RenderOptions): Promise<RenderResult> {
     const siblings = useCache && content !== null
       ? readProjectSiblings(filePath, fileType, ref, repoRoot)
       : [];
+    // Layer set for this side. Resolved per side (not once per file) so a
+    // 2 → 4 layer change between refs renders the new inner layers on the
+    // after side only.
+    const boardSrc = fileType === "pcb" ? content!.toString("utf8") : "";
+    const pcbLayers = fileType !== "pcb" ? [] : opts.layers ?? defaultPcbLayers(boardSrc);
     const cacheHash = (useCache && content !== null)
-      ? cacheKeyFor(content, fileType, filePath, siblings)
+      ? cacheKeyFor(content, fileType, filePath, siblings, pcbLayers)
       : null;
 
     if (cacheHash && loadFromCache(cacheHash, sideDir, safe, fileType)) {
@@ -1246,6 +1281,8 @@ export interface ProjectRenderOptions {
   /** Force single-file mode (set by `pcb`/`sch` subcommand). When set, only
    *  the file matching the scope is rendered, no sibling auto-detection. */
   scope?: FileType;
+  /** PCB layer override, see RenderOptions.layers. */
+  layers?: string[];
 }
 
 export interface ProjectRenderResult {
@@ -1460,6 +1497,7 @@ export async function renderProject(opts: ProjectRenderOptions): Promise<Project
         toRef: pinnedToRef,
         imagesOnly: true, // we'll generate one combined HTML below
         noCache: opts.noCache,
+        layers: opts.layers,
       }),
     ),
   );

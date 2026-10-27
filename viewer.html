@@ -229,12 +229,48 @@ const ZOOM_MIN = 0.25, ZOOM_MAX = 16;
 
 /* Base z-order: bottom to top. The active layer is boosted above all others
    but keeps the same opacity — matching KiCad's behavior where the active
-   layer is on top but equally semi-transparent. */
-const LAYER_ORDER = ['Edge.Cuts','B.Silkscreen','B.Cu','F.Cu','F.Silkscreen'];
+   layer is on top but equally semi-transparent.
+   Edge.Cuts, back non-copper (B.*), B.Cu, inner copper from the back
+   (InN.Cu … In1.Cu), F.Cu, front non-copper (F.*), anything else; ties by
+   name. Kept in lock-step with compareLayerStack in src/layers.ts, which
+   orders the composited PNG the same way. */
+function layerStackKey(name) {
+  if (name === 'Edge.Cuts') return [0, 0];
+  if (name === 'B.Cu') return [2, 0];
+  if (name === 'F.Cu') return [4, 0];
+  const inner = /^In(\d+)\.Cu$/.exec(name);
+  if (inner) return [3, -Number(inner[1])];
+  if (name.startsWith('B.')) return [1, 0];
+  if (name.startsWith('F.')) return [5, 0];
+  return [6, 0];
+}
+function orderLayers(names) {
+  return [...names].sort((a, b) => {
+    const ka = layerStackKey(a), kb = layerStackKey(b);
+    return (ka[0] - kb[0]) || (ka[1] - kb[1]) || (a < b ? -1 : a > b ? 1 : 0);
+  });
+}
 const LAYER_COLORS = {
   'F.Cu':'#c83232','B.Cu':'#3232c8','F.Silkscreen':'#c8c832',
   'B.Silkscreen':'#32c8c8','Edge.Cuts':'#c8c864'
 };
+/* Swatches for In1.Cu … In30.Cu: KiCad's default-theme colours, i.e. what
+   kicad-cli actually plots each inner layer in. */
+const INNER_CU_COLORS = [
+  '#7fc87f','#ce7d2c','#4fcbcb','#db628b','#a7a5c6','#28ccd9','#e8b2a7','#f2eda1',
+  '#8dcb81','#ed7c33','#5bc3eb','#f76f8e','#a7a5c6','#28ccd9','#e8b2a7','#f2eda1',
+  '#ed7c33','#5bc3eb','#f76f8e','#a7a5c6','#28ccd9','#e8b2a7','#f2eda1','#ed7c33',
+  '#5bc3eb','#f76f8e','#a7a5c6','#28ccd9','#e8b2a7','#f2eda1'
+];
+function layerColor(name) {
+  if (LAYER_COLORS[name]) return LAYER_COLORS[name];
+  const inner = /^In(\d+)\.Cu$/.exec(name);
+  return (inner && INNER_CU_COLORS[Number(inner[1]) - 1]) || '#888';
+}
+/* Bottom-to-top order of the current file's layers: the union of both
+   sides, so a layer that exists on only one side (e.g. a 2 → 4 layer
+   change) still gets a row and a stacking position. */
+let layerOrder = [];
 
 // --- Init ---
 function init() {
@@ -249,6 +285,7 @@ function rebuildForCurrentFile() {
   // Reset per-file state so switching files doesn't carry stale toggles
   layerVisible = {};
   activeLayer = null;
+  layerOrder = [];
   showDiff = true;
   swipePct = 50;
   // Overlay is the default when both sides exist (most useful for spotting
@@ -402,11 +439,14 @@ function buildTabs() {
    Schematic: only the diff toggle is shown (no layer concept)
    Hidden entirely if neither layers nor diff are available. */
 function buildLayerPanel() {
-  // Layer panel sources its layer list from after.layers (when present).
-  // For deleted-at-target files we still want to expose the same toggles
-  // against the before side; fall back to before.layers in that case.
+  // Layer panel lists the union of both sides' layers. For
+  // deleted-at-target files that is just the before side's layers, and a
+  // layer added or removed between refs still gets a toggle.
   const layersSource = M.after?.layers || M.before?.layers;
   const hasLayers = M.type === 'pcb' && layersSource;
+  layerOrder = hasLayers
+    ? orderLayers(new Set([...Object.keys(M.after?.layers || {}), ...Object.keys(M.before?.layers || {})]))
+    : [];
   const hasDiff = M.diff && M.hasBefore;
   // The panel itself is only useful when there are layers (PCB). The diff
   // toggle lives in the header now, so sch/sym/fp don't need this panel.
@@ -416,7 +456,7 @@ function buildLayerPanel() {
   }
   const list = $('#layer-list');
 
-  const available = hasLayers ? LAYER_ORDER.filter(n => layersSource[n]) : [];
+  const available = layerOrder;
 
   available.forEach(name => {
     layerVisible[name] = true;
@@ -437,7 +477,7 @@ function buildLayerPanel() {
 
     const swatch = document.createElement('div');
     swatch.className = 'swatch';
-    swatch.style.background = LAYER_COLORS[name] || '#888';
+    swatch.style.background = layerColor(name);
 
     const lname = document.createElement('div');
     lname.className = 'lname';
@@ -735,7 +775,7 @@ function makeLayerStack(side, id) {
   stack.className = 'layer-stack'; stack.id = id;
 
   if (data.layers && M.type === 'pcb') {
-    LAYER_ORDER.forEach((name, i) => {
+    layerOrder.forEach((name, i) => {
       if (!data.layers[name]) return;
       const img = document.createElement('img');
       img.src = data.layers[name];
@@ -805,11 +845,11 @@ function makeLayerStack(side, id) {
    This matches KiCad's rendering where the active layer differs only
    in z-order (topmost), not in transparency. */
 function applyLayers() {
-  const maxBase = LAYER_ORDER.length;
+  const maxBase = layerOrder.length;
   $$('.layer-stack img[data-layer]').forEach(img => {
     const name = img.dataset.layer;
     img.style.display = layerVisible[name] ? '' : 'none';
-    const baseIdx = LAYER_ORDER.indexOf(name);
+    const baseIdx = layerOrder.indexOf(name);
     img.style.zIndex = (name === activeLayer) ? maxBase + 10 : baseIdx + 1;
     img.style.opacity = '0.6';
   });

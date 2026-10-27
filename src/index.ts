@@ -31,6 +31,7 @@ import { textDiff, markdownDiff, computeFileDiff, type FileDiff } from "./textdi
 import { renderTemplate } from "./template.ts";
 import { runCheck, checkKindFor, formatCheckDiff } from "./check.ts";
 import { runCache } from "./cache.ts";
+import { parseLayerList } from "./layers.ts";
 import type { FileType } from "./types.ts";
 
 function usage(): void {
@@ -121,6 +122,10 @@ Options:
   -q, --quiet            Suppress the summary entirely
   --log <level>          Set summary log level: quiet | info | debug (default: info)
   --no-cache             Skip the render cache (default: cached at \$XDG_CACHE_HOME/kicadiff)
+  --layers <list>        PCB layers to render, comma-separated kicad-cli layer
+                         names (e.g. \`F.Cu,In1.Cu,B.Cu,Edge.Cuts\`). Default:
+                         every copper layer the board defines (F.Cu, In1.Cu …
+                         InN.Cu, B.Cu) + F.Silkscreen, B.Silkscreen, Edge.Cuts.
   --exit-code            Exit with status 1 if any change is detected, 0 otherwise.
                          Errors still exit non-zero. Mirrors \`git diff --exit-code\`.
   --watch                Long-running mode: re-render whenever an input KiCad
@@ -136,6 +141,7 @@ Options:
 Env:
   KICADIFF_OPEN_CMD      Override --open command (full command, html path
                          appended; empty string = no-op). Useful for testing.
+  KICADIFF_LAYERS        Default for --layers (the flag wins when both are set).
 
 Examples:
   kicadiff                              # cwd, combined PCB+sch — index vs working
@@ -184,6 +190,9 @@ interface ParsedArgs {
   logLevel?: LogLevel;
   /** Disable the per-side render cache (default: cache enabled). */
   noCache?: boolean;
+  /** PCB layer override from --layers / KICADIFF_LAYERS. Undefined means
+   *  "the board's copper layers + silk + outline" (resolved in render). */
+  layers?: string[];
   scope?: FileType;
   open?: string;
   /** Long-running watch mode: re-render on file change. Hot-reload of the
@@ -298,6 +307,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   let mdFileTemplate: string | undefined;
   let logLevel: LogLevel | undefined;
   let noCache = false;
+  let layers: string[] | undefined;
   let open: string | undefined;
   let watch = false;
   let cached = false;
@@ -342,6 +352,11 @@ function parseArgs(argv: string[]): ParsedArgs {
       mdFileTemplate = argv[++i];
     } else if (arg === "--no-cache") {
       noCache = true;
+    } else if (arg === "--layers") {
+      if (i + 1 >= argv.length) throw new Error("--layers requires a value");
+      layers = parseLayerList(argv[++i]);
+    } else if (arg.startsWith("--layers=")) {
+      layers = parseLayerList(arg.slice("--layers=".length));
     } else if (arg === "--watch") {
       watch = true;
     } else if (arg === "--exit-code") {
@@ -374,6 +389,12 @@ function parseArgs(argv: string[]): ParsedArgs {
     } else {
       positional.push(arg);
     }
+  }
+
+  // The env var lets callers that can't add flags (e.g. a CI step wrapping
+  // the GitHub Action) pick the layer set. An explicit flag still wins.
+  if (layers === undefined && process.env.KICADIFF_LAYERS) {
+    layers = parseLayerList(process.env.KICADIFF_LAYERS);
   }
 
   // Determine which positional is the input, which are refs.
@@ -489,8 +510,8 @@ function parseArgs(argv: string[]): ParsedArgs {
 
   return {
     input, fromRef, toRef, outputDir, outputHtml, imagesOnly, text, textOnly,
-    markdown, mdTemplate, mdFileTemplate, logLevel, noCache, scope, open, watch,
-    exitCode,
+    markdown, mdTemplate, mdFileTemplate, logLevel, noCache, layers, scope, open,
+    watch, exitCode,
   };
 }
 
@@ -644,6 +665,7 @@ async function main(): Promise<void> {
         open: parsed.open,
         scope: parsed.scope,
         noCache: parsed.noCache,
+        layers: parsed.layers,
       });
       return;
     }
@@ -680,6 +702,7 @@ async function main(): Promise<void> {
       open: parsed.open,
       scope: parsed.scope,
       noCache: parsed.noCache,
+      layers: parsed.layers,
     });
     // When stdout is reserved for the markdown report (--md --output stdout/-),
     // route the summary line to stderr so the user can pipe `> report.md`

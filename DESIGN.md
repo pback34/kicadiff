@@ -381,7 +381,7 @@ KiCad は複数の関連ファイル型を持つ。kicadiff は以下を扱う:
 
 | 型     | 拡張子        | 中身                           | レンダリング単位       |
 |--------|---------------|--------------------------------|------------------------|
-| `pcb`  | `.kicad_pcb`  | 基板配置 + 埋め込みフットプリント | レイヤー (5 種類) ごと |
+| `pcb`  | `.kicad_pcb`  | 基板配置 + 埋め込みフットプリント | レイヤーごと (後述)     |
 | `sch`  | `.kicad_sch`  | 回路図 + 埋め込みシンボル       | 階層シートごと          |
 | `sym`  | `.kicad_sym`  | シンボルライブラリ              | シンボルごと            |
 | `fp`   | `.kicad_mod`  | 単一フットプリント              | 1 個                    |
@@ -404,7 +404,16 @@ content-hash キャッシュの妥当性の根拠 (詳細は後述)。
   - sym: ライブラリ内の各シンボル
   - fp: 通常 1 個 (内部的には pages = [{name, png}])
   - pcb: pages 概念なし (代わりに layer)
-- **layer**: PCB のレイヤー (F.Cu, B.Cu, F.Silkscreen, B.Silkscreen, Edge.Cuts)
+- **layer**: PCB のレイヤー。デフォルトはボードの `(layers …)` table に
+  ある全銅箔層 (F.Cu, In1.Cu … InN.Cu, B.Cu) + F.Silkscreen,
+  B.Silkscreen, Edge.Cuts で、side ごとに解決する (ref 間で層数が変わって
+  も各 side が自分の層を持つ)。`--layers` / `KICADIFF_LAYERS` で上書き可。
+  user name 付きの銅箔層 (`(4 "In1.Cu" power "GND")`) は kicad-cli が
+  `<board>-GND.svg` として出力するので、canonical 名 (`In1_Cu`) に
+  rename してから manifest に載せる。重ね順 (下→上) は Edge.Cuts, B.*,
+  B.Cu, InN.Cu … In1.Cu, F.Cu, F.*, その他 — composite
+  (`src/layers.ts` の `compareLayerStack`) と viewer (`layerStackKey`)
+  で同じ規則を使う
 
 manifest 上は file が `after.pages[]` を持つかどうかで page 切替の
 有無が決まる。
@@ -487,6 +496,8 @@ sha256(
   + kicad-cli --version   # kicad-cli の挙動が変わったとき切り替わる
   + file_type             # pcb/sch/sym/fp で別 entry
   + abs_file_path         # 同 content でも path が違えば別 entry
+  + pcb_layers            # kicad-cli に渡す --layers (pcb のみ。--layers で
+                          #  content 不変のまま変わりうる)
   + sibling .kicad_pro / .kicad_prl content (pcb/sch のみ)
   + source_content
 )

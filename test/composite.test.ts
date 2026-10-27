@@ -35,6 +35,7 @@ test("layerNameFromFile parses kicad-cli output naming", () => {
   expect(layerNameFromFile("preview_xxx-F_Cu.png")).toBe("F.Cu");
   expect(layerNameFromFile("board-Edge_Cuts.svg")).toBe("Edge.Cuts");
   expect(layerNameFromFile("a-B_Silkscreen.png")).toBe("B.Silkscreen");
+  expect(layerNameFromFile("my-board-In2_Cu.png")).toBe("In2.Cu");
 });
 
 test("returns false when the layers dir doesn't exist", () => {
@@ -44,12 +45,41 @@ test("returns false when the layers dir doesn't exist", () => {
   expect(fs.existsSync(out)).toBe(false);
 });
 
-test("returns false when no recognised layers are present", () => {
+test("returns false when the layers dir holds no layer PNGs", () => {
   const dir = freshDir();
-  // Only an unrecognised layer present
-  makeLayer(dir, "User_Drawings", () => [255, 0, 0, 255]);
+  fs.writeFileSync(path.join(dir, "board-F_Cu.svg"), "<svg/>");
   const out = path.join(dir, "out.png");
   expect(compositePcbLayers(dir, out)).toBe(false);
+});
+
+test("layers outside the default set (picked via --layers) are composited too", () => {
+  // The layers dir only ever holds what render.ts asked kicad-cli for, so
+  // a layer the user explicitly selected must not be dropped.
+  const dir = freshDir();
+  makeLayer(dir, "User.Drawings", () => [255, 0, 0, 255]);
+  const out = path.join(dir, "out.png");
+  expect(compositePcbLayers(dir, out)).toBe(true);
+  expect(read(fs.readFileSync(out), 0, 0)).toEqual([165, 12, 12, 255]);
+});
+
+test("inner copper stacks between B.Cu and F.Cu, In1.Cu above In2.Cu", () => {
+  // For each pair, the upper layer is painted GREEN and the lower RED, both
+  // fully covering the canvas; the upper one blends in last, so green wins.
+  const pairs: [lower: string, upper: string][] = [
+    ["B.Cu", "In2.Cu"],
+    ["In2.Cu", "In1.Cu"],
+    ["In1.Cu", "F.Cu"],
+    ["In10.Cu", "In9.Cu"],
+  ];
+  for (const [lower, upper] of pairs) {
+    const dir = freshDir();
+    makeLayer(dir, lower, () => [255, 0, 0, 255]);
+    makeLayer(dir, upper, () => [0, 255, 0, 255]);
+    const out = path.join(dir, "out.png");
+    expect(compositePcbLayers(dir, out)).toBe(true);
+    const px = read(fs.readFileSync(out), 0, 0);
+    expect(px[1], `${upper} should be above ${lower}`).toBeGreaterThan(px[0]);
+  }
 });
 
 test("active layer (F.Cu) wins on top regardless of base z-order", () => {
