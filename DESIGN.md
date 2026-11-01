@@ -207,6 +207,12 @@ bar.kicad_sch (erc): +0 -0 =3
 - 意図的に除外しているもの: `uuid` (再生成されうる)、`pos` (0.01mm の
   ナッジで新規違反扱いになるのを防ぐ)、`severity` (config 変更で
   warning → error 昇格しただけのケースで `+1 -1` にしない)。
+- 例外として `unconnected_items` だけは item description ではなく
+  **net 名** (`Pad 2 [GND] of SW1` の `GND`) で同一視する。島に分かれた
+  net について kicad-cli は欠けている ratsnest edge ごとに 1 件出すが、
+  どの pad / track / via を端点として挙げるかは同じ board でも実行ごとに
+  変わるため、item で照合すると `check A A` が `+N -N` になる。net ごとの
+  件数は安定しているので、multiset 差分のまま島が 1 つ増えれば +1 になる。
 
 git ref からの実行も対応。`render.ts` の temp lifecycle パターンを
 踏襲しつつ、`check` は per-side のキャッシュ整合性を気にしないので、

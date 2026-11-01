@@ -92,6 +92,63 @@ test.describe("signatureOf", () => {
   });
 });
 
+test.describe("signatureOf: unconnected_items", () => {
+  // For a net split into islands, KiCad reports one unconnected_items
+  // entry per missing ratsnest edge, but *which* pad / track / via it names
+  // as the endpoints varies from run to run on the same board. Identity is
+  // therefore the net, not the endpoints; the per-net count is stable.
+  test("same net, different endpoints → same signature", () => {
+    const a = v("unconnected_items", "Missing connection between items", [
+      { description: "Pad 2 [GND] of SW1 on F.Cu" },
+      { description: "Via [GND] on F.Cu - B.Cu" },
+    ]);
+    const b = v("unconnected_items", "Missing connection between items", [
+      { description: "Pad 2 [GND] of SW1 on F.Cu" },
+      { description: "Track [GND] on B.Cu, length 5.4375 mm" },
+    ]);
+    expect(signatureOf(a)).toBe(signatureOf(b));
+  });
+
+  test("different nets → different signatures", () => {
+    const a = v("unconnected_items", "x", [
+      { description: "Pad 1 [/RST] of SW1 on F.Cu" },
+      { description: "Track [/RST] on F.Cu, length 5.4447 mm" },
+    ]);
+    const b = v("unconnected_items", "x", [
+      { description: "Pad 1 [+3V3] of U1 on F.Cu" },
+      { description: "Track [+3V3] on F.Cu, length 2.5000 mm" },
+    ]);
+    expect(signatureOf(a)).not.toBe(signatureOf(b));
+  });
+
+  test("net names containing brackets are kept whole", () => {
+    const a = v("unconnected_items", "x", [{ description: "Pad 3 [/D[0]] of U1 on F.Cu" }]);
+    const b = v("unconnected_items", "x", [{ description: "Track [/D[0]] on B.Cu, length 1.0000 mm" }]);
+    const c = v("unconnected_items", "x", [{ description: "Pad 4 [/D[1]] of U1 on F.Cu" }]);
+    expect(signatureOf(a)).toBe(signatureOf(b));
+    expect(signatureOf(a)).not.toBe(signatureOf(c));
+  });
+
+  test("other violation types still key on the item descriptions", () => {
+    const a = v("clearance", "x", [{ description: "Pad 2 [GND] of SW1 on F.Cu" }]);
+    const b = v("clearance", "x", [{ description: "Via [GND] on F.Cu - B.Cu" }]);
+    expect(signatureOf(a)).not.toBe(signatureOf(b));
+  });
+
+  test("diff counts per net: one extra island on a net is +1", () => {
+    const edge = (endpoint: string) => v("unconnected_items", "x", [
+      { description: "Pad 1 [GND] of C1 on F.Cu" }, { description: endpoint },
+    ]);
+    const d = diffViolations(
+      [edge("Via [GND] on F.Cu - B.Cu")],
+      [edge("Track [GND] on B.Cu, length 1.0000 mm"), edge("Pad 2 [GND] of C2 on F.Cu")],
+    );
+    expect(d.added).toHaveLength(1);
+    expect(d.removed).toHaveLength(0);
+    expect(d.unchanged).toHaveLength(1);
+  });
+});
+
 test.describe("diffViolations", () => {
   test("empty before + empty after → empty diff", () => {
     const d = diffViolations([], []);
@@ -537,6 +594,25 @@ test.describe("kicadiff check (integration)", () => {
       expect(r.stdout).toContain("(drc)");
       expect(r.stdout).toMatch(/\+0\b/);
       expect(r.stdout).toMatch(/-0\b/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("HEAD vs HEAD on a board with zones and unconnected nets: exits 0, reports +0 -0", () => {
+    // Regression: identical refs used to report e.g. `+3 -3` and exit 1,
+    // because kicad-cli picks different endpoints for the same missing
+    // connection on every run. Run twice to make a lucky pass unlikely.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-check-zones-"));
+    try {
+      const pcb = initRepoWithMcuBoard(tmp);
+      for (let run = 0; run < 2; run++) {
+        const r = spawnSync(CLI, ["check", "HEAD", "HEAD", pcb], {
+          cwd: tmp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+        });
+        expect(r.stdout).toMatch(/\(drc\): \+0 -0 =[1-9]\d*/);
+        expect(r.status).toBe(0);
+      }
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

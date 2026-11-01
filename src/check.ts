@@ -78,10 +78,30 @@ export interface ViolationDiff {
 //     incidental edit.
 //   - Items are sorted before hashing so kicad-cli's traversal order
 //     doesn't affect identity.
+//   - Exception: `unconnected_items` is identified by its *net*, not by
+//     its items. For a net split into islands kicad-cli reports one entry
+//     per missing ratsnest edge, but which pad / track / via it names as
+//     the two endpoints changes from run to run on an identical board, so
+//     item-based identity turned `check A A` into `+N -N`. The number of
+//     entries per net is stable, and the multiset diff below still counts
+//     an extra island as one new violation.
 // =============================================================================
 
+/** Net name from a DRC item description such as
+ *  `Pad 2 [GND] of SW1 on F.Cu` or `Track [/D[0]] on B.Cu, length 1 mm`.
+ *  Greedy so bus-style names with brackets stay whole. */
+function netOfItem(description: string): string | null {
+  const m = /\[(.*)\]/.exec(description);
+  return m ? m[1] : null;
+}
+
 export function signatureOf(v: Violation): string {
-  const itemKeys = v.items.map((i) => i.description).sort();
+  let itemKeys = v.items.map((i) => i.description).sort();
+  if (v.type === "unconnected_items") {
+    const nets = v.items.map((i) => netOfItem(i.description));
+    // Fall back to the descriptions if any item carries no net name.
+    if (nets.every((n) => n !== null)) itemKeys = [...new Set(nets as string[])].sort();
+  }
   const h = crypto.createHash("sha256");
   h.update(v.type);
   h.update("\0");
