@@ -12,24 +12,14 @@
  * matches the interactive view.
  *
  * Layer order and opacity here are kept deliberately in lock-step
- * with viewer.html's LAYER_ORDER + applyLayers (`opacity: 0.6`,
+ * with viewer.html's layerStackKey + applyLayers (`opacity: 0.6`,
  * active layer's zIndex bumped above the others).
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { PNG } from "pngjs";
-
-/** Bottom-to-top base z-order. F.Cu's effective z-index gets bumped
- *  to the top by the active-layer rule below; everything else stays
- *  at its index in this array. Mirrors viewer.html's LAYER_ORDER. */
-const LAYER_ORDER = [
-  "Edge.Cuts",
-  "B.Silkscreen",
-  "B.Cu",
-  "F.Cu",
-  "F.Silkscreen",
-] as const;
+import { compareLayerStack } from "./layers.ts";
 
 /** Default active layer the viewer selects on load. */
 const ACTIVE_LAYER = "F.Cu";
@@ -52,22 +42,21 @@ export function layerNameFromFile(filename: string): string {
   return layerToken.replace(/_/g, ".");
 }
 
-/** Sort the available layers in render order (bottom first). The
- *  active layer is pinned to the end (top of the stack) regardless
- *  of its base index, matching viewer.applyLayers's z-index logic. */
+/** Sort the available layers in render order (bottom first, see
+ *  compareLayerStack). The active layer is pinned to the end (top of
+ *  the stack) regardless of its base position, matching
+ *  viewer.applyLayers's z-index logic. */
 function renderOrder(present: readonly string[]): string[] {
-  return [...present].sort((a, b) => zIndex(a) - zIndex(b));
-}
-
-function zIndex(name: string): number {
-  if (name === ACTIVE_LAYER) return 1_000_000; // always on top
-  const idx = LAYER_ORDER.indexOf(name as typeof LAYER_ORDER[number]);
-  return idx === -1 ? -1 : idx;
+  const rest = present.filter(n => n !== ACTIVE_LAYER).sort(compareLayerStack);
+  return present.includes(ACTIVE_LAYER) ? [...rest, ACTIVE_LAYER] : rest;
 }
 
 /** Composite the per-layer PNGs from `layersDir` into `outputPng`.
+ *  Every layer PNG in the directory takes part: the directory only holds
+ *  the layers render.ts asked kicad-cli for (the board's copper layers +
+ *  silk + outline by default, or the user's `--layers` selection).
  *  Returns true when a composite was produced, false when the
- *  directory had no recognised layer files (caller can fall back).
+ *  directory had no layer files (caller can fall back).
  *  Throws on dimension mismatch — that's a rendering bug, not a
  *  recoverable condition. */
 export function compositePcbLayers(layersDir: string, outputPng: string): boolean {
@@ -76,10 +65,7 @@ export function compositePcbLayers(layersDir: string, outputPng: string): boolea
   const files = fs.readdirSync(layersDir).filter((f) => f.endsWith(".png"));
   const byName: Record<string, string> = {};
   for (const f of files) {
-    const name = layerNameFromFile(f);
-    if ((LAYER_ORDER as readonly string[]).includes(name)) {
-      byName[name] = path.join(layersDir, f);
-    }
+    byName[layerNameFromFile(f)] = path.join(layersDir, f);
   }
   const order = renderOrder(Object.keys(byName));
   if (order.length === 0) return false;

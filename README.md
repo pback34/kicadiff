@@ -11,7 +11,8 @@ file in your browser, or as a markdown report you can paste into a PR.
 ## What you get
 
 - **HTML viewer** with side-by-side / overlay / swipe modes, layer toggles
-  for PCBs, page navigation for hierarchical schematics, wheel-to-zoom and
+  for PCBs (every copper layer the board defines, inner layers included),
+  page navigation for hierarchical schematics, wheel-to-zoom and
   right-click-drag-to-pan, and an amber tab marker on files / pages whose
   rendered output actually changed.
 - **Markdown report** (`--md`) with side-by-side image tables and a
@@ -147,6 +148,14 @@ kicadiff project/ -v                    # verbose summary (full PNG paths)
 kicadiff project/ -q                    # suppress summary
 kicadiff project/ --no-cache            # bypass the render cache
 kicadiff project/ --exit-code           # exit 1 if any change (mirrors `git diff --exit-code`)
+
+# PCB layer selection. Default: every copper layer in the board's layer
+# table (F.Cu, In1.Cu … InN.Cu, B.Cu) + F.Silkscreen, B.Silkscreen,
+# Edge.Cuts. Override with a comma-separated list of kicad-cli layer names,
+# or set KICADIFF_LAYERS (handy where flags can't be added, e.g. as `env:`
+# on a step that uses the GitHub Action). The flag wins over the env var.
+kicadiff pcb board.kicad_pcb --layers F.Cu,In1.Cu,B.Cu,Edge.Cuts
+KICADIFF_LAYERS=F.Cu,F.Fab,Edge.Cuts kicadiff project/
 
 # Claude Code PostToolUse hook integration. Reads the hook JSON from
 # stdin, renders only when the edited file is .kicad_pcb / .kicad_sch.

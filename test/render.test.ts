@@ -4,6 +4,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { PNG } from "pngjs";
+import { FOUR_LAYER_LAYERS, FOUR_LAYER_PCB, twoLayerVariant } from "./four-layer-fixture.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1492,6 +1494,171 @@ test.describe("ref pinning", () => {
       // removed-component count is non-zero (every component in the PCB
       // was deleted along with the file).
       expect(r.stdout).toMatch(/-[1-9]\d* ~\d+ =\d+/);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// =============================================================================
+// Multi-layer PCBs: the copper layer set comes from the board's own layer
+// table, so inner layers (In1.Cu …) are rendered instead of silently
+// dropped. `--layers` / KICADIFF_LAYERS override the set.
+// =============================================================================
+
+test.describe("multi-layer PCB", () => {
+  /** Env without a KICADIFF_LAYERS leaking in from the caller's shell. */
+  function cleanEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+    const env = { ...process.env, ...extra };
+    if (!("KICADIFF_LAYERS" in extra)) delete env.KICADIFF_LAYERS;
+    return env;
+  }
+
+  /** Commit `pcbSource` as board.kicad_pcb in a fresh repo under `dir`. */
+  function initRepoWithBoard(dir: string, pcbSource: string): string {
+    const pcb = path.join(dir, "board.kicad_pcb");
+    fs.writeFileSync(pcb, pcbSource);
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dir });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+      "-c", "user.name=t", "add", "."], { cwd: dir });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "user.email=t@t",
+      "-c", "user.name=t", "commit", "-q", "-m", "init"], { cwd: dir });
+    return pcb;
+  }
+
+  function renderPcb(cwd: string, args: string[], env: NodeJS.ProcessEnv = cleanEnv()): void {
+    const r = spawnSync(CLI, ["pcb", ...args], {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env,
+    });
+    if (r.status !== 0) throw new Error(`kicadiff failed (${r.status}): ${r.stderr}`);
+  }
+
+  /** Layer names in a side's manifest entry, sorted. */
+  function manifestLayers(outDir: string, side: "before" | "after"): string[] {
+    const m = readManifest(path.join(outDir, "board_diff.html")) as any;
+    return Object.keys(m.files[0][side]?.layers ?? {}).sort();
+  }
+
+  test("renders every copper layer the board defines, including In1.Cu / In2.Cu", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-4layer-"));
+    try {
+      const pcb = initRepoWithBoard(tmp, fs.readFileSync(FOUR_LAYER_PCB, "utf8"));
+      const out = path.join(tmp, "out");
+      renderPcb(tmp, ["HEAD", pcb, "--output-dir", out]);
+      expect(manifestLayers(out, "after")).toEqual(FOUR_LAYER_LAYERS);
+      expect(manifestLayers(out, "before")).toEqual(FOUR_LAYER_LAYERS);
+      // The inner-layer PNGs exist and actually carry the tracks routed
+      // on them (not just a transparent canvas).
+      const layersDir = path.join(out, "after/layers_board.kicad_pcb");
+      for (const layer of ["In1_Cu", "In2_Cu"]) {
+        const png = PNG.sync.read(fs.readFileSync(path.join(layersDir, `board-${layer}.png`)));
+        let painted = 0;
+        for (let i = 3; i < png.data.length; i += 4) if (png.data[i] > 0) painted++;
+        expect(painted, `${layer} has no drawn pixels`).toBeGreaterThan(0);
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("2-layer board keeps exactly the historical 5-layer set", () => {
+    runCli(["pcb", PCB_FILE, "--output-dir", outputDir], { env: cleanEnv() });
+    const m = readManifest(path.join(outputDir, PROJECT_HTML)) as any;
+    expect(Object.keys(m.files[0].after.layers).sort())
+      .toEqual(["B.Cu", "B.Silkscreen", "Edge.Cuts", "F.Cu", "F.Silkscreen"]);
+  });
+
+  test("--layers overrides the layer set (both `--layers X` and `--layers=X`)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-layers-flag-"));
+    try {
+      const pcb = initRepoWithBoard(tmp, fs.readFileSync(FOUR_LAYER_PCB, "utf8"));
+      const out1 = path.join(tmp, "out1");
+      renderPcb(tmp, ["HEAD", pcb, "--layers", "In2.Cu, Edge.Cuts", "--output-dir", out1]);
+      expect(manifestLayers(out1, "after")).toEqual(["Edge.Cuts", "In2.Cu"]);
+      const out2 = path.join(tmp, "out2");
+      renderPcb(tmp, ["HEAD", pcb, "--layers=F.Cu,F.Mask", "--output-dir", out2]);
+      expect(manifestLayers(out2, "after")).toEqual(["F.Cu", "F.Mask"]);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("KICADIFF_LAYERS sets the default layer set; --layers wins over it", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-layers-env-"));
+    try {
+      const pcb = initRepoWithBoard(tmp, fs.readFileSync(FOUR_LAYER_PCB, "utf8"));
+      const env = cleanEnv({ KICADIFF_LAYERS: "In1.Cu,B.Cu" });
+      const out1 = path.join(tmp, "out1");
+      renderPcb(tmp, ["HEAD", pcb, "--output-dir", out1], env);
+      expect(manifestLayers(out1, "after")).toEqual(["B.Cu", "In1.Cu"]);
+      const out2 = path.join(tmp, "out2");
+      renderPcb(tmp, ["HEAD", pcb, "--layers", "F.Cu", "--output-dir", out2], env);
+      expect(manifestLayers(out2, "after")).toEqual(["F.Cu"]);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty --layers value is rejected", () => {
+    const r = runCli(["pcb", PCB_FILE, "--layers", " , ", "--output-dir", outputDir],
+      { allowFailure: true, env: cleanEnv() });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/--layers needs at least one layer/);
+  });
+
+  test("changing the layer set is not served a stale cached render", () => {
+    // Same board content, same path, different --layers: the cache key
+    // must include the layer set, otherwise the second run would restore
+    // the first run's 2-layer PNGs.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-layers-cache-"));
+    try {
+      const pcb = initRepoWithBoard(tmp, fs.readFileSync(FOUR_LAYER_PCB, "utf8"));
+      const env = cleanEnv({ KICADIFF_CACHE_DIR: path.join(tmp, "cache") });
+      const out1 = path.join(tmp, "out1");
+      renderPcb(tmp, ["HEAD", pcb, "--layers", "F.Cu,B.Cu", "--output-dir", out1], env);
+      expect(manifestLayers(out1, "after")).toEqual(["B.Cu", "F.Cu"]);
+      const out2 = path.join(tmp, "out2");
+      renderPcb(tmp, ["HEAD", pcb, "--output-dir", out2], env);
+      expect(manifestLayers(out2, "after")).toEqual(FOUR_LAYER_LAYERS);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("copper layers with a user name are keyed by their canonical name", () => {
+    // kicad-cli names a layer's plot file after its user name
+    // (`(4 "In1.Cu" power "GND")` → board-GND.svg). The manifest must
+    // still say In1.Cu so ordering / colours / the active layer work.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-layers-renamed-"));
+    try {
+      const renamed = fs.readFileSync(FOUR_LAYER_PCB, "utf8")
+        .replace('(0 "F.Cu" signal)', '(0 "F.Cu" signal "Top")')
+        .replace('(4 "In1.Cu" power)', '(4 "In1.Cu" power "GND-plane")')
+        .replace('(6 "In2.Cu" signal)', '(6 "In2.Cu" signal "Sig 2.x")');
+      const pcb = initRepoWithBoard(tmp, renamed);
+      const out = path.join(tmp, "out");
+      renderPcb(tmp, ["HEAD", pcb, "--output-dir", out]);
+      expect(manifestLayers(out, "after")).toEqual(FOUR_LAYER_LAYERS);
+      expect(manifestLayers(out, "before")).toEqual(FOUR_LAYER_LAYERS);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("a layer-count change between refs renders each side with its own layers", () => {
+    // HEAD is the 4-layer board, the working tree drops the inner layers.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "kicadiff-layers-change-"));
+    try {
+      const src = fs.readFileSync(FOUR_LAYER_PCB, "utf8");
+      const pcb = initRepoWithBoard(tmp, src);
+      fs.writeFileSync(pcb, twoLayerVariant(src));
+      const out = path.join(tmp, "out");
+      renderPcb(tmp, ["HEAD", pcb, "--output-dir", out]);
+      expect(manifestLayers(out, "before")).toEqual(FOUR_LAYER_LAYERS);
+      expect(manifestLayers(out, "after"))
+        .toEqual(["B.Cu", "B.Silkscreen", "Edge.Cuts", "F.Cu", "F.Silkscreen"]);
+      const m = readManifest(path.join(out, "board_diff.html")) as any;
+      expect(m.files[0].hasDiff).toBe(true);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

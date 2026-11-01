@@ -12,8 +12,8 @@ KiCad プロジェクト用の visual diff ツール。`.kicad_pcb` /
 ## 提供する機能
 
 - **HTML ビューア** — Side-by-Side / Overlay / Swipe の3表示モード、
-  PCB のレイヤー切替、階層回路図のページナビ、ホイールズーム + 右
-  クリックドラッグでパン、視覚的に変更があったタブ・ページに琥珀色の
+  PCB のレイヤー切替 (内層を含む、ボードが定義する全銅箔層)、
+  階層回路図のページナビ、ホイールズーム + 右クリックドラッグでパン、視覚的に変更があったタブ・ページに琥珀色の
   マーカー。
 - **Markdown レポート** (`--md`) — side-by-side の画像テーブルと、
   Reference designator 単位の構造差分 (追加 / 削除 / 変更)。PR の
@@ -128,6 +128,14 @@ kicadiff project/ -v                    # PNG パスまで出すサマリ
 kicadiff project/ -q                    # サマリ抑止
 kicadiff project/ --no-cache            # キャッシュをバイパス
 kicadiff project/ --exit-code           # 変更があれば exit 1 (`git diff --exit-code` 互換)
+
+# PCB のレンダリング対象レイヤー。デフォルトはボードの layer table にある
+# 全銅箔層 (F.Cu, In1.Cu … InN.Cu, B.Cu) + F.Silkscreen, B.Silkscreen,
+# Edge.Cuts。kicad-cli のレイヤー名をカンマ区切りで渡すと上書きできる。
+# フラグを足せない場所 (GitHub Action を使う step の `env:` など) では
+# KICADIFF_LAYERS でも指定可。両方あればフラグが優先。
+kicadiff pcb board.kicad_pcb --layers F.Cu,In1.Cu,B.Cu,Edge.Cuts
+KICADIFF_LAYERS=F.Cu,F.Fab,Edge.Cuts kicadiff project/
 
 # Claude Code PostToolUse hook 統合。stdin から hook の JSON を読んで、
 # 編集対象が .kicad_pcb / .kicad_sch のときだけレンダリングする。
