@@ -27,6 +27,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import which from "which";
 import { resolveRefToSha } from "./render.ts";
 
 // =============================================================================
@@ -196,15 +197,54 @@ function runKicadCli(
   }
 }
 
+/** Whether this kicad-cli's `pcb drc` accepts `--refill-zones` (added in
+ *  KiCad 10.0; KiCad 9 rejects it as an unknown argument). Probed from
+ *  `pcb drc --help` rather than parsed from `--version`, and memoised per
+ *  resolved binary so PATH changes (tests swap in shims) are honoured.
+ *  Any probe failure answers "no": the real DRC call below then surfaces
+ *  the actual launch / exit problem with its usual diagnostics. */
+const refillSupport = new Map<string, boolean>();
+function drcSupportsRefillZones(): boolean {
+  const bin = which.sync("kicad-cli", { nothrow: true });
+  if (bin === null) return false;
+  let supported = refillSupport.get(bin);
+  if (supported === undefined) {
+    const r = spawnSync(bin, ["pcb", "drc", "--help"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    supported = !r.error && r.status === 0 && (r.stdout ?? "").includes("--refill-zones");
+    refillSupport.set(bin, supported);
+  }
+  return supported;
+}
+
+let warnedNoRefill = false;
+
 /** Run `kicad-cli pcb drc --format json` on `inputPcb` and return the parsed
  *  violations. We pass `--severity-all` so the diff sees every level
  *  (errors, warnings, exclusions) — under-reporting at the source would be
- *  unrecoverable downstream. */
+ *  unrecoverable downstream.
+ *
+ *  `--refill-zones` makes DRC see the same copper the designer does: without
+ *  it kicad-cli checks the fill saved in the file, and a stale or missing
+ *  fill (any zone edit saved without pressing B) reports every pad the pour
+ *  should connect as unconnected_items. It refills in memory only — the
+ *  board is written back solely with `--save-board`, which we never pass —
+ *  and `inputPcb` is always a scratch copy (see materializeAtRef). */
 export function runDrc(inputPcb: string, outputJson: string): Violation[] {
-  runKicadCli(
-    ["pcb", "drc", "--severity-all", "--format", "json", "--output", outputJson, inputPcb],
-    outputJson, "pcb drc", inputPcb,
-  );
+  const args = ["pcb", "drc", "--severity-all", "--format", "json"];
+  if (drcSupportsRefillZones()) {
+    args.push("--refill-zones");
+  } else if (!warnedNoRefill && which.sync("kicad-cli", { nothrow: true }) !== null) {
+    warnedNoRefill = true;
+    process.stderr.write(
+      "Warning: this kicad-cli has no `pcb drc --refill-zones` (KiCad 10+); DRC uses the zone fills saved in the file, so stale fills may show up as unconnected_items.\n",
+    );
+  }
+  args.push("--output", outputJson, inputPcb);
+  runKicadCli(args, outputJson, "pcb drc", inputPcb);
   return parseDrcViolations(outputJson, inputPcb);
 }
 

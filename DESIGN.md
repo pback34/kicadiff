@@ -216,6 +216,16 @@ rule (clearance, track width, …) に依存するので siblings の抽出は
 必須。working tree の汚染を避けるための finally unlink ダンスは
 tmpdir 一括削除に集約できる。
 
+DRC は `--refill-zones` 付きで実行する。ファイルに保存されている zone
+fill は stale なことがあり (zone を編集して refill せずに保存した等)、
+そのまま DRC すると pour が繋ぐはずのパッドが大量の `unconnected_items`
+として出て、GUI で見る結果と食い違う。refill は in-memory のみで、
+board を書き戻すのは `--save-board` を付けたときだけ (付けない)。そもそも
+入力は上記 tmpdir のコピーなのでユーザーのファイルには触れない。
+`--refill-zones` は KiCad 10.0 で追加されたフラグで、KiCad 9 の
+kicad-cli は未知の引数として reject するため、`pcb drc --help` で
+feature 検出し、無ければ付けずに警告を 1 回出す。
+
 終了コードは「**新規違反があれば 1**」。pre-existing な違反が残って
 いるだけでは fail しない — PR gate の意図は「この変更が違反を持ち
 込んだか」であって「全違反ゼロか」ではないため。CI で全違反ゼロを

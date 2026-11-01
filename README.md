@@ -160,7 +160,9 @@ kicadiff hook
 # violations that persist do not fail the gate. Operational failures
 # (missing kicad-cli, git errors, JSON parse errors) also produce a
 # non-zero exit. Useful as a PR gate that fails only on regressions,
-# independent of any visual diff.
+# independent of any visual diff. With KiCad 10+, DRC refills zones first
+# (in memory, on a temp copy), so stale saved fills don't show up as
+# unconnected items.
 kicadiff check                          # PCB+sch in cwd, index vs working
 kicadiff check HEAD project/            # working tree vs HEAD
 kicadiff check main..feat foo.kicad_pcb # main vs feat, PCB only
